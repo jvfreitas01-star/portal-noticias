@@ -142,13 +142,26 @@ article.no {{ opacity:.45; }}
 #sync button, footer button {{ font:inherit; font-size:13px; color:var(--accent); background:none; border:0;
                                padding:0; cursor:pointer; text-decoration:underline; }}
 footer {{ margin-top:40px; font-size:13px; color:var(--muted); }}
+#tokform {{ margin-top:10px; }}
+#tokform:not([hidden]) {{ display:grid; gap:6px; }}
+#tokform .row {{ display:flex; gap:6px; }}
+#tok {{ flex:1; min-width:0; font:inherit; padding:8px 10px; color:inherit; background:transparent;
+        border:1px solid var(--line); border-radius:8px; }}
+footer button.save {{ text-decoration:none; color:#fff; background:var(--accent); padding:8px 14px; border-radius:8px; }}
 </style></head>
 <body><main>
 <header><h1>Portal · {date}</h1><span class="st">{s} histórias de {n} manchetes · gerado às {time}</span></header>
 {badge}
 {body}
 <div id="sync"></div>
-<footer>👍/👎 ensinam o ranking. <button id="cfg">Configurar envio de votos</button></footer>
+<footer>👍/👎 ensinam o ranking. <button id="cfg">Configurar envio de votos</button>
+<form id="tokform" hidden>
+  <label for="tok">Token do GitHub (fine-grained, só o repositório do portal, Contents: Read and write).
+  Fica só neste navegador.</label>
+  <div class="row"><input id="tok" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…">
+  <button type="submit" class="save">Salvar</button></div>
+  <span id="tokmsg"></span>
+</form></footer>
 </main>
 <script id="portal-data" type="application/json">__DATA__</script>
 <script>__VOTE_JS__</script>
@@ -224,14 +237,28 @@ async function send() {
     }
   } catch (e) { lastError = e.message || "sem conexão"; }
   busy = false; paint();
+  if (!form.hidden) msg.textContent = lastError ? "Erro: " + lastError : queue.length ? msg.textContent : "Votos enviados ✓";
   if (queue.length && !lastError) send();
 }
 
+// Campo na própria página (alguns navegadores de celular bloqueiam a caixa prompt()).
+const form = document.getElementById("tokform"), msg = document.getElementById("tokmsg");
 function configure() {
-  const t = prompt("Cole o token do GitHub (fine-grained, só o repositório do portal, permissão Contents: Read and write). Deixe vazio para apagar o token deste aparelho.", "");
-  if (t === null) return;
-  token = t.trim(); ls.set("gh_token", token); lastError = ""; send(); paint();
+  form.hidden = !form.hidden;
+  msg.textContent = token ? "Já existe um token salvo neste navegador. Salve vazio para apagar." : "";
+  if (!form.hidden) { document.getElementById("tok").focus(); form.scrollIntoView({block: "center"}); }
 }
+form.addEventListener("submit", e => {
+  e.preventDefault();
+  const inp = document.getElementById("tok");
+  token = inp.value.trim().replace(/^Bearer\s+/i, ""); inp.value = "";
+  ls.set("gh_token", token);
+  let saved = false; try { saved = localStorage.getItem("gh_token") !== null; } catch {}
+  msg.textContent = !token ? "Token apagado deste navegador."
+    : saved ? "Token salvo. Enviando votos…"
+    : "Este navegador não deixa guardar dados (janela anônima?). Vale só até fechar a página.";
+  lastError = ""; send(); paint();
+});
 
 document.addEventListener("click", e => {
   const b = e.target.closest(".vote button");
