@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -78,29 +79,47 @@ def order_by_similarity(items: list[dict]) -> list[int]:
 
 # ---------- chamada à LLM ----------
 
+# Preferidos quando LLM_MODELS está vazio (grátis e com JSON em 2026-11-20). Os que sumirem do
+# catálogo são pulados; se nenhum sobrar, usa os :free maiores que o catálogo oferecer.
+PREFERRED = ["google/gemma-4-31b-it:free", "nvidia/nemotron-3.5-super-vl:free", "google/gemma-4-26b-a4b-it:free"]
+
 _free_cache: list[str] | None = None
+_lock = threading.Lock()
+_auth_failed = False  # chave recusada: não adianta tentar outros modelos (e cada tentativa gasta cota)
 
 
 def _models() -> list[str]:
     global _free_cache
     if LLM_MODELS:
         return LLM_MODELS
-    if _free_cache is None:
-        try:
-            data = requests.get("https://openrouter.ai/api/v1/models", timeout=30).json()["data"]
-            _free_cache = [m["id"] for m in data if m["id"].endswith(":free")
-                           and "response_format" in (m.get("supported_parameters") or [])]
-        except Exception:
-            log.exception("não consegui listar modelos grátis")
-            _free_cache = []
-        log.info("modelos grátis descobertos: %s", _free_cache[:5])
+    with _lock:
+        if _free_cache is None:
+            try:
+                data = requests.get("https://openrouter.ai/api/v1/models", timeout=30).json()["data"]
+                free = {m["id"]: m.get("context_length") or 0 for m in data if m["id"].endswith(":free")
+                        and "response_format" in (m.get("supported_parameters") or [])}
+                rest = sorted((m for m in free if m not in PREFERRED), key=lambda m: -_size(m))
+                _free_cache = [m for m in PREFERRED if m in free] + rest
+            except Exception:
+                log.exception("não consegui listar modelos grátis")
+                _free_cache = list(PREFERRED)
+            log.info("modelos, em ordem: %s", _free_cache[:MAX_TRIES_PER_BATCH])
     return _free_cache
 
 
+def _size(model_id: str) -> float:
+    """Tamanho em bilhões de parâmetros lido do nome (ex.: '31b' -> 31); 0 se não houver."""
+    nums = re.findall(r"(\d+(?:\.\d+)?)b\b", model_id.lower())
+    return max(map(float, nums)) if nums else 0.0
+
+
 def call_llm(prompt: str) -> str | None:
-    if not LLM_API_KEY:
+    global _auth_failed
+    if not LLM_API_KEY or _auth_failed:
         return None
     for model in _models()[:MAX_TRIES_PER_BATCH]:
+        if _auth_failed:
+            return None
         try:
             r = requests.post(LLM_URL, timeout=180, headers={"Authorization": f"Bearer {LLM_API_KEY}"},
                               json={"model": model, "temperature": 0, "max_tokens": 4000,
@@ -115,6 +134,10 @@ def call_llm(prompt: str) -> str | None:
                 if text:
                     return text
             log.warning("modelo %s: HTTP %s %s", model, r.status_code, r.text[:200])
+            if r.status_code in (401, 403):
+                _auth_failed = True
+                log.error("chave LLM_API_KEY recusada: confira o segredo no GitHub")
+                return None
         except Exception as e:
             log.warning("modelo %s: %s", model, e)
     return None
