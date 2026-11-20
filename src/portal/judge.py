@@ -36,6 +36,8 @@ MAX_TRIES_PER_BATCH = 3  # no plano grátis do OpenRouter (50/dia) falhas també
 GENERIC = set(fold(w) for w in """
 mercado mercados bolsa bolsas ações acoes dolar dólar stocks market markets rally shares
 brasil governo diz após apos sobre contra para entre mais novo nova anos hoje
+bilhao bilhoes milhao milhoes bilhão bilhões milhão milhões queda alta sobe cai caem sobem segundo
+diante durante ainda pode podem deve devem quer pede afirma anuncia empresa empresas""".split() + """
 says after over with from that this what into amid could will would""".split())
 
 
@@ -338,12 +340,16 @@ def merge_pass(stories: list[dict]) -> list[dict]:
     lines = "\n".join(f"[{k}] ({s['items'][0]['source']}) {s['items'][0]['title']}" for k, s in enumerate(cands))
     prompt = f"""Cada linha abaixo é uma história diferente de um noticiário, em português ou inglês.
 Encontre:
-- "same": grupos de linhas que são O MESMO acontecimento (mesma empresa e mesmo negócio, mesma decisão,
-  mesmo dado divulgado, mesmo pregão). Ler uma torna as outras redundantes. Português e inglês sobre o mesmo
-  fato contam como o mesmo.
-- "related": grupos de linhas sobre acontecimentos DIFERENTES mas num tema estreito e comum (ex.: dois
-  desdobramentos do mesmo caso judicial no mesmo dia). Tema amplo ("mercados", "política") não basta.
-Na dúvida, não agrupe. Cada linha entra em no máximo um grupo. Grupos têm 2 ou mais linhas.
+- "same": grupos de linhas que relatam O MESMO acontecimento: o mesmo ato, da mesma pessoa ou empresa,
+  no mesmo dia (a mesma emissão, a mesma decisão judicial, o mesmo dado divulgado, o mesmo fechamento de
+  bolsa). Ler uma torna as outras redundantes. Português e inglês sobre o mesmo fato contam como o mesmo.
+  NÃO são o mesmo: depoimentos de pessoas diferentes no mesmo caso; decisões diferentes do mesmo tribunal;
+  uma empresa e a reação do mercado a ela; duas empresas fazendo coisas parecidas.
+- "related": desdobramentos DIFERENTES de um mesmo caso ou da mesma empresa (ex.: dois depoimentos no
+  mesmo inquérito; o plano de investimento e o projeto de usinas da mesma companhia).
+  NÃO são relacionadas: empresas diferentes no mesmo setor; o mesmo país em assuntos diferentes.
+Na dúvida, não agrupe: deixar separado é sempre aceitável, juntar errado esconde notícia.
+Cada linha entra em no máximo um grupo. Grupos têm 2 ou mais linhas.
 Responda só com JSON: {{"same": [[int]], "related": [[int]]}}
 
 HISTÓRIAS:
@@ -363,7 +369,16 @@ HISTÓRIAS:
             except (TypeError, ValueError):
                 continue
             idx = _connected_group(idx, cands)  # mesmo guarda dos lotes: precisa dividir palavras
+            if key == "same" and len(idx) >= 2:
+                # "mesmo fato" exige mais: 2+ palavras distintivas em comum entre os TÍTULOS PRINCIPAIS e o da
+                # história de maior nota. Perde algumas junções português/inglês, mas juntar errado esconde
+                # notícia (pior que ver uma repetida).
+                best = max(idx, key=lambda i: cands[i]["score"] or 0)
+                stems = lambda s: {w[:5] for w in _title_words(s["items"][0])}  # 'contábeis' ~ 'contabilidade'
+                bw = stems(cands[best])
+                idx = [i for i in idx if i == best or len(stems(cands[i]) & bw) >= 2]
             if len(idx) >= 2:
+                log.info("junção %s: %s", key, " || ".join(cands[i]["items"][0]["title"][:50] for i in idx))
                 used.update(idx)
                 out.append(idx)
         return out
