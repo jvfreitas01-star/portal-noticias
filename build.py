@@ -55,11 +55,16 @@ def story_html(s: dict) -> str:
 def render(stories: list[dict], mode: str, n_items: int) -> str:
     secs = sections(load_brief()) + [("0", "Outros")]
     now = datetime.now(BRT)
+    # Teto global pelas MAIORES notas (não por ordem de seção, senão a última seção fica vazia).
+    passing = [s for s in stories if s["pass"]]
+    if mode == "ai":
+        keep = {id(s) for s in sorted(passing, key=lambda s: -(s["score"] or 0))[:MAX_SHOWN]}
+    else:  # sem LLM: até 8 por seção, para nenhuma engolir as outras
+        keep = {id(s) for sid, _ in secs for s in [x for x in passing if x["sec"] == sid][:8]}
     body, shown = [], 0
     for sid, name in secs:
         mine = [s for s in stories if s["sec"] == sid]
-        cap = MAX_SHOWN - shown if mode == "ai" else 8   # sem LLM, nenhuma seção engole as outras
-        top = [s for s in mine if s["pass"]][: max(0, cap)]
+        top = [s for s in mine if id(s) in keep]
         shown += len(top)
         rest = [s for s in mine if s not in top][:MAX_MORE]
         if not top and not rest:

@@ -132,6 +132,7 @@ def call_llm(prompt: str) -> str | None:
             if r.ok:
                 text = (r.json().get("choices") or [{}])[0].get("message", {}).get("content")
                 if text:
+                    log.info("lote respondido por %s", model)
                     return text
             log.warning("modelo %s: HTTP %s %s", model, r.status_code, r.text[:200])
             if r.status_code in (401, 403):
