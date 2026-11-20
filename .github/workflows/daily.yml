@@ -1,0 +1,60 @@
+# Roda todo dia às 6h (Brasília) nos servidores do GitHub e publica a página no GitHub Pages.
+# Também dá para rodar na mão: aba Actions > "Portal diário" > Run workflow.
+name: Portal diário
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # 09:00 UTC = 06:00 BRT (o GitHub pode atrasar alguns minutos)
+  workflow_dispatch:
+
+permissions:
+  contents: write   # grava o arquivo do dia em archive/
+  pages: write
+  id-token: write
+
+concurrency:
+  group: portal
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Gerar página
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODELS: ${{ vars.LLM_MODELS }}
+          JUDGE_THRESHOLD: ${{ vars.JUDGE_THRESHOLD || '70' }}
+        run: python build.py
+
+      # Guarda o resultado do dia. Também mantém o repositório "ativo": o GitHub desliga
+      # agendamentos de repositórios públicos sem nenhum commit em 60 dias.
+      - name: Arquivar o dia
+        run: |
+          mkdir -p archive
+          cp site/data.json "archive/$(TZ=America/Sao_Paulo date +%F).json"
+          git config user.name "portal-bot"
+          git config user.email "portal-bot@users.noreply.github.com"
+          git add archive
+          git commit -m "arquivo $(TZ=America/Sao_Paulo date +%F)" || echo "nada novo"
+          git push
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

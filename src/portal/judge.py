@@ -1,0 +1,268 @@
+"""LLM agrupa manchetes em histórias, dá nota 0-100 e escolhe a seção.
+
+Usa qualquer API compatível com OpenAI chat-completions (padrão: OpenRouter, modelos :free).
+Se a LLM falhar, a história cai no plano B por palavra-chave (mostra mais, nunca menos).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import requests
+
+from .core import fold, match
+
+log = logging.getLogger("portal.judge")
+
+ROOT = Path(__file__).resolve().parents[2]
+PREFS = ROOT / "config" / "preferences.md"
+
+LLM_URL = os.environ.get("LLM_URL", "https://openrouter.ai/api/v1/chat/completions")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+# Lista de modelos tentados em ordem. Modelos grátis mudam: se vazio, descobre os :free do OpenRouter.
+LLM_MODELS = [m.strip() for m in os.environ.get("LLM_MODELS", "").split(",") if m.strip()]
+THRESHOLD = int(os.environ.get("JUDGE_THRESHOLD", "70"))
+BATCH = 40
+MAX_TRIES_PER_BATCH = 3  # no plano grátis do OpenRouter (50/dia) falhas também contam
+
+GENERIC = set(fold(w) for w in """
+mercado mercados bolsa bolsas ações acoes dolar dólar stocks market markets rally shares
+brasil governo diz após apos sobre contra para entre mais novo nova anos hoje
+says after over with from that this what into amid could will would""".split())
+
+
+# ---------- brief e seções ----------
+
+def load_brief() -> str:
+    text = PREFS.read_text(encoding="utf-8")
+    m = re.search(r"^## Goals brief\s*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    return (m.group(1) if m else text).strip()
+
+
+def sections(brief: str) -> list[tuple[str, str]]:
+    return [(i, n.strip()) for i, n in re.findall(r"^\s*(\d+b?)\.\s+\*\*(.+?)\.?\*\*", brief, re.M)]
+
+
+# ---------- similaridade (só para ordenar os lotes) ----------
+
+def _words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]{4,}", fold(text)) if w not in GENERIC]
+
+
+def _cos(a: Counter, b: Counter) -> float:
+    num = sum(a[k] * b[k] for k in a.keys() & b.keys())
+    den = math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values()))
+    return num / den if den else 0.0
+
+
+def order_by_similarity(items: list[dict]) -> list[int]:
+    """Cadeia do vizinho mais próximo: manchetes parecidas caem no mesmo lote."""
+    n = len(items)
+    if n == 0:
+        return []
+    vecs = [Counter(_words(f"{i['title']} {i['summary'][:200]}")) for i in items]
+    seq, left = [0], set(range(1, n))
+    while left:
+        last = vecs[seq[-1]]
+        nxt = max(left, key=lambda j: (_cos(last, vecs[j]), -j))
+        seq.append(nxt)
+        left.remove(nxt)
+    return seq
+
+
+# ---------- chamada à LLM ----------
+
+_free_cache: list[str] | None = None
+
+
+def _models() -> list[str]:
+    global _free_cache
+    if LLM_MODELS:
+        return LLM_MODELS
+    if _free_cache is None:
+        try:
+            data = requests.get("https://openrouter.ai/api/v1/models", timeout=30).json()["data"]
+            _free_cache = [m["id"] for m in data if m["id"].endswith(":free")
+                           and "response_format" in (m.get("supported_parameters") or [])]
+        except Exception:
+            log.exception("não consegui listar modelos grátis")
+            _free_cache = []
+        log.info("modelos grátis descobertos: %s", _free_cache[:5])
+    return _free_cache
+
+
+def call_llm(prompt: str) -> str | None:
+    if not LLM_API_KEY:
+        return None
+    for model in _models()[:MAX_TRIES_PER_BATCH]:
+        try:
+            r = requests.post(LLM_URL, timeout=180, headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                              json={"model": model, "temperature": 0, "max_tokens": 4000,
+                                    "response_format": {"type": "json_object"},
+                                    "reasoning": {"enabled": False},
+                                    "messages": [
+                                        {"role": "system", "content": "Editor de notícias de empresas, crédito e "
+                                         "infraestrutura. Responda com um único objeto JSON. Sem prosa. Comece com {"},
+                                        {"role": "user", "content": prompt}]})
+            if r.ok:
+                text = (r.json().get("choices") or [{}])[0].get("message", {}).get("content")
+                if text:
+                    return text
+            log.warning("modelo %s: HTTP %s %s", model, r.status_code, r.text[:200])
+        except Exception as e:
+            log.warning("modelo %s: %s", model, e)
+    return None
+
+
+def parse_json(text: str | None) -> dict | None:
+    if not text or "{" not in text:
+        return None
+    try:
+        obj, _ = json.JSONDecoder(strict=False).raw_decode(text[text.find("{"):])
+        return obj if isinstance(obj, dict) else None
+    except ValueError:
+        return None
+
+
+# ---------- prompt ----------
+
+def build_prompt(brief: str, secs: list[tuple[str, str]], batch: list[dict]) -> str:
+    sec_list = "\n".join(f'"{i}" = {n}' for i, n in secs) + '\n"0" = outro / nenhuma'
+    lines = "\n".join(f"[{k}] ({it['source']}) {it['title']} — {it['summary'][:200]}"
+                      for k, it in enumerate(batch))
+    return f"""O QUE EU QUERO LER:
+{brief}
+
+SEÇÕES:
+{sec_list}
+
+TAREFA:
+Agrupe as manchetes abaixo em histórias. Uma história = um acontecimento: manchetes em que ler uma
+torna as outras redundantes (mesma empresa e mesmo negócio, mesma decisão, mesmo dado divulgado).
+Tema parecido não basta. Na dúvida, separe. Manchetes em português e inglês sobre o mesmo fato vão juntas.
+Para cada história dê:
+- "items": índices das manchetes
+- "lead": índice da manchete mais informativa
+- "head": as 4 primeiras palavras da manchete lead, copiadas
+- "s": 0 a 100, a chance de eu querer ler isto
+- "sec": id da seção
+- "why": até 8 palavras, em português
+Toda manchete deve aparecer em exatamente uma história.
+Responda só com JSON: {{"stories": [{{"items": [int], "lead": int, "head": str, "s": int, "sec": str, "why": str}}]}}
+
+MANCHETES:
+{lines}"""
+
+
+# ---------- guardas: não confiar nos índices da LLM ----------
+
+def _title_words(it: dict) -> set[str]:
+    return set(_words(it["title"]))
+
+
+def _head_ok(head: str, lead_item: dict) -> bool:
+    hw = set(re.findall(r"[a-z0-9]+", fold(head or "")))
+    tw = set(re.findall(r"[a-z0-9]+", fold(lead_item["title"])))
+    return bool(hw & tw)
+
+
+def _connected(idx: list[int], lead: int, batch: list[dict]) -> tuple[list[int], list[int]]:
+    """Itens precisam dividir uma palavra (4+ letras, não genérica) com o lead, direto ou em cadeia."""
+    ok, todo = {lead}, set(idx) - {lead}
+    changed = True
+    while changed and todo:
+        changed = False
+        for j in list(todo):
+            if any(_title_words(batch[j]) & _title_words(batch[k]) for k in ok):
+                ok.add(j)
+                todo.remove(j)
+                changed = True
+    return sorted(ok), sorted(todo)
+
+
+def judge_batch(brief, secs, batch: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Devolve (histórias, extraviados). Itens que a LLM esqueceu viram histórias sem nota."""
+    valid_secs = {i for i, _ in secs}
+    data = parse_json(call_llm(build_prompt(brief, secs, batch)))
+    if not data or not isinstance(data.get("stories"), list):
+        return [_single(it, None) for it in batch], []
+
+    used: set[int] = set()
+    stories, strays = [], []
+    for s in data["stories"]:
+        try:
+            idx = sorted({int(i) for i in s.get("items", []) if 0 <= int(i) < len(batch)} - used)
+            lead = int(s.get("lead", idx[0] if idx else -1))
+        except (TypeError, ValueError):
+            continue
+        if not idx:
+            continue
+        if lead not in idx:
+            lead = idx[0]
+        if not _head_ok(str(s.get("head", "")), batch[lead]):
+            strays += [batch[i] for i in idx]   # índices escorregaram
+            used.update(idx)
+            continue
+        good, bad = _connected(idx, lead, batch)
+        strays += [batch[i] for i in bad]
+        used.update(idx)
+        try:
+            score = max(0, min(100, int(s.get("s", 0))))
+        except (TypeError, ValueError):
+            score = None
+        sec = str(s.get("sec", "0"))
+        stories.append({
+            "items": [batch[lead]] + [batch[i] for i in good if i != lead],
+            "score": score,
+            "sec": sec if sec in valid_secs else "0",
+            "why": str(s.get("why", ""))[:80],
+        })
+    stories += [_single(batch[i], None) for i in range(len(batch)) if i not in used]
+    return stories, strays
+
+
+def _single(item: dict, score) -> dict:
+    groups = item.get("groups") or []
+    return {"items": [item], "score": score, "sec": groups[0] if groups else "0", "why": ""}
+
+
+# ---------- orquestração ----------
+
+def judge_stories(pool: list[dict]) -> tuple[list[dict], str]:
+    """Devolve (histórias, modo). modo = 'ai' se a LLM respondeu, 'rules' se só palavra-chave."""
+    brief = load_brief()
+    secs = sections(brief)
+    seq = order_by_similarity(pool)
+    batches = [[pool[i] for i in seq[k:k + BATCH]] for k in range(0, len(seq), BATCH)]
+    log.info("julgando %d manchetes em %d lotes", len(pool), len(batches))
+
+    stories, strays = [], []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for st, sy in ex.map(lambda b: judge_batch(brief, secs, b), batches):
+            stories += st
+            strays += sy
+    if strays:  # uma segunda chance, num lote só deles
+        log.info("%d extraviados, nova rodada", len(strays))
+        for k in range(0, len(strays), BATCH):
+            st, sy = judge_batch(brief, secs, strays[k:k + BATCH])
+            stories += st + [_single(it, None) for it in sy]
+
+    scored = sum(1 for s in stories if s["score"] is not None)
+    mode = "ai" if scored else "rules"
+    for s in stories:
+        if s["score"] is None:  # lote falhou: plano B por palavra-chave (fail-open)
+            s["pass"] = any(match(f"{it['title']} {it['summary']}") for it in s["items"])
+        else:
+            s["pass"] = s["score"] >= THRESHOLD
+    order = {i: n for n, (i, _) in enumerate(secs)}
+    stories.sort(key=lambda s: (order.get(s["sec"], 99), -(s["score"] if s["score"] is not None else -1),
+                                -len(s["items"])))
+    log.info("modo=%s histórias=%d com_nota=%d passam=%d", mode, len(stories), scored,
+             sum(s["pass"] for s in stories))
+    return stories, mode
