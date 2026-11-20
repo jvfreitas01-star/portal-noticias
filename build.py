@@ -57,6 +57,13 @@ def story_html(s: dict, k: int, texts: dict[str, str]) -> str:
         rows = "".join(f'<li><a href="{esc(i["link"])}" target="_blank" rel="noopener">{esc(i["title"])}</a>'
                        f' <span class="meta">{esc(i["source"])}</span></li>' for i in rest)
         more = f'<details class="also"><summary>+{len(rest)} fonte(s)</summary><ul>{rows}</ul></details>'
+    if s.get("related"):  # notícias diferentes do mesmo tema estreito, aninhadas pela passada de junção
+        rows = "".join(f'<li><a href="{esc(r["items"][0]["link"])}" target="_blank" rel="noopener">'
+                       f'{esc(r["items"][0]["title"])}</a> <span class="meta">{esc(r["items"][0]["source"])}'
+                       f'{" +" + str(len(r["items"]) - 1) if len(r["items"]) > 1 else ""}</span></li>'
+                       for r in s["related"])
+        more += (f'<details class="also"><summary>{len(s["related"])} relacionada(s)</summary>'
+                 f'<ul>{rows}</ul></details>')
     summary = f'<div class="sum">{esc(lead["summary"])}</div>' if lead["summary"] else ""
     return (f'<article>{score}<a class="t" href="{esc(lead["link"])}" target="_blank" rel="noopener"{read}>'
             f'{esc(lead["title"])}</a><div class="meta">{esc(lead["source"])} · {hhmm(lead["published"])}{why}{badge}</div>'

@@ -302,6 +302,100 @@ def _single(item: dict, score) -> dict:
     return {"items": [item], "score": score, "sec": groups[0] if groups else "0", "why": ""}
 
 
+# ---------- passada de junção: a mesma notícia partida entre lotes ----------
+
+MERGE_MIN = 50    # só histórias com nota a partir daqui entram na junção
+MERGE_MAX = 150   # teto de histórias numa chamada (tamanho do prompt)
+
+
+def _story_words(s: dict) -> set[str]:
+    return set().union(*(_title_words(i) for i in s["items"]))
+
+
+def _connected_group(idx: list[int], cands: list[dict]) -> list[int]:
+    """Maior grupo ligado por palavras de título (direto ou em cadeia), a partir do de maior nota."""
+    if not idx:
+        return []
+    start = max(idx, key=lambda i: cands[i]["score"] or 0)
+    ok, todo, changed = {start}, set(idx) - {start}, True
+    while changed and todo:
+        changed = False
+        for j in list(todo):
+            if any(_story_words(cands[j]) & _story_words(cands[k]) for k in ok):
+                ok.add(j)
+                todo.remove(j)
+                changed = True
+    return sorted(ok)
+
+
+def merge_pass(stories: list[dict]) -> list[dict]:
+    """Uma chamada com o lead de cada história forte: junta as que são o mesmo fato ('same') e
+    aninha as de tema muito próximo sob a melhor ('related'). Se a LLM falhar, nada muda."""
+    cands = sorted((s for s in stories if (s["score"] or 0) >= MERGE_MIN),
+                   key=lambda s: -(s["score"] or 0))[:MERGE_MAX]
+    if len(cands) < 2:
+        return stories
+    lines = "\n".join(f"[{k}] ({s['items'][0]['source']}) {s['items'][0]['title']}" for k, s in enumerate(cands))
+    prompt = f"""Cada linha abaixo é uma história diferente de um noticiário, em português ou inglês.
+Encontre:
+- "same": grupos de linhas que são O MESMO acontecimento (mesma empresa e mesmo negócio, mesma decisão,
+  mesmo dado divulgado, mesmo pregão). Ler uma torna as outras redundantes. Português e inglês sobre o mesmo
+  fato contam como o mesmo.
+- "related": grupos de linhas sobre acontecimentos DIFERENTES mas num tema estreito e comum (ex.: dois
+  desdobramentos do mesmo caso judicial no mesmo dia). Tema amplo ("mercados", "política") não basta.
+Na dúvida, não agrupe. Cada linha entra em no máximo um grupo. Grupos têm 2 ou mais linhas.
+Responda só com JSON: {{"same": [[int]], "related": [[int]]}}
+
+HISTÓRIAS:
+{lines}"""
+    data = parse_json(call_llm(prompt))
+    if not data:
+        log.info("junção: sem resposta da LLM, histórias ficam como estão")
+        return stories
+
+    used: set[int] = set()
+
+    def groups(key: str) -> list[list[int]]:
+        out = []
+        for g in data.get(key) or []:
+            try:
+                idx = sorted({int(i) for i in g if 0 <= int(i) < len(cands)} - used)
+            except (TypeError, ValueError):
+                continue
+            idx = _connected_group(idx, cands)  # mesmo guarda dos lotes: precisa dividir palavras
+            if len(idx) >= 2:
+                used.update(idx)
+                out.append(idx)
+        return out
+
+    gone: set[int] = set()  # id() das histórias absorvidas
+    n_same = n_rel = 0
+    for idx in groups("same"):
+        best = max((cands[i] for i in idx), key=lambda s: s["score"] or 0)
+        for i in idx:
+            s = cands[i]
+            if s is best:
+                continue
+            seen = {it["link"] for it in best["items"]}
+            best["items"] += [it for it in s["items"] if it["link"] not in seen]
+            best.setdefault("related", []).extend(s.get("related", []))
+            gone.add(id(s))
+            n_same += 1
+    for idx in groups("related"):
+        best = max((cands[i] for i in idx), key=lambda s: s["score"] or 0)
+        for i in idx:
+            s = cands[i]
+            if s is best or id(s) in gone:
+                continue
+            best.setdefault("related", []).append(
+                {"items": s["items"], "score": s["score"], "why": s.get("why", "")})
+            best["related"].extend(s.get("related", []))
+            gone.add(id(s))
+            n_rel += 1
+    log.info("junção: %d histórias unidas como mesmo fato, %d aninhadas como relacionadas", n_same, n_rel)
+    return [s for s in stories if id(s) not in gone]
+
+
 # ---------- orquestração ----------
 
 def judge_stories(pool: list[dict]) -> tuple[list[dict], str]:
@@ -326,6 +420,8 @@ def judge_stories(pool: list[dict]) -> tuple[list[dict], str]:
 
     scored = sum(1 for s in stories if s["score"] is not None)
     mode = "ai" if scored else "rules"
+    if scored:
+        stories = merge_pass(stories)
     for s in stories:
         if s["score"] is None:  # lote falhou: plano B por palavra-chave (fail-open)
             s["pass"] = any(match(f"{it['title']} {it['summary']}") for it in s["items"])
