@@ -41,6 +41,7 @@ jobs:
       - name: Gerar página
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          READER_PASSWORD: ${{ secrets.READER_PASSWORD }}
           LLM_MODELS: ${{ vars.LLM_MODELS }}
           JUDGE_THRESHOLD: ${{ vars.JUDGE_THRESHOLD || '70' }}
         run: |
