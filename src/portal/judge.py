@@ -5,6 +5,7 @@ Se a LLM falhar, a história cai no plano B por palavra-chave (mostra mais, nunc
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -154,14 +155,59 @@ def parse_json(text: str | None) -> dict | None:
         return None
 
 
+# ---------- votos como exemplos ----------
+
+LABELS = ROOT / "labels" / "labels.jsonl"
+
+
+def is_holdout(link: str) -> bool:
+    """1 em cada 4 links fica fora dos exemplos, reservado para medir a qualidade depois."""
+    return int(hashlib.sha1(link.encode("utf-8")).hexdigest(), 16) % 4 == 0
+
+
+def load_votes() -> list[dict]:
+    """Último voto de cada link (CLEAR = voto desfeito), sem os reservados para teste."""
+    if not LABELS.exists():
+        return []
+    last: dict[str, dict] = {}
+    for line in LABELS.read_text(encoding="utf-8").splitlines():
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        if v.get("link"):
+            last[v["link"]] = v
+    return [v for v in last.values() if v.get("label") in ("YES", "NO") and not is_holdout(v["link"])]
+
+
+def pick_examples(batch: list[dict], votes: list[dict], k: int = 20) -> list[dict]:
+    """Os k votos SIM e k votos NÃO mais parecidos com este lote."""
+    if not votes:
+        return []
+    target = Counter(w for it in batch for w in _words(f"{it['title']} {it['summary'][:200]}"))
+    out = []
+    for label in ("YES", "NO"):
+        pool = [v for v in votes if v["label"] == label]
+        pool.sort(key=lambda v: -_cos(target, Counter(_words(f"{v['title']} {v.get('summary', '')}"))))
+        out += pool[:k]
+    return out
+
+
 # ---------- prompt ----------
 
-def build_prompt(brief: str, secs: list[tuple[str, str]], batch: list[dict]) -> str:
+def build_prompt(brief: str, secs: list[tuple[str, str]], batch: list[dict],
+                 examples: list[dict] | None = None) -> str:
     sec_list = "\n".join(f'"{i}" = {n}' for i, n in secs) + '\n"0" = outro / nenhuma'
     lines = "\n".join(f"[{k}] ({it['source']}) {it['title']} — {it['summary'][:200]}"
                       for k, it in enumerate(batch))
+    ex = ""
+    if examples:
+        rows = "\n".join(f"{'SIM' if v['label'] == 'YES' else 'NÃO'} ({v.get('source', '')}) {v['title']}"
+                         f" — {v.get('summary', '')[:120]}" for v in examples)
+        ex = (f"\n\nMEUS VOTOS ANTERIORES (SIM = quis ler, NÃO = não quis). Quando os votos e o texto acima "
+              f"discordarem, os votos valem mais:\n{rows}")
     return f"""O QUE EU QUERO LER:
-{brief}
+{brief}{ex}
 
 SEÇÕES:
 {sec_list}
@@ -210,10 +256,10 @@ def _connected(idx: list[int], lead: int, batch: list[dict]) -> tuple[list[int],
     return sorted(ok), sorted(todo)
 
 
-def judge_batch(brief, secs, batch: list[dict]) -> tuple[list[dict], list[dict]]:
+def judge_batch(brief, secs, batch: list[dict], votes: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     """Devolve (histórias, extraviados). Itens que a LLM esqueceu viram histórias sem nota."""
     valid_secs = {i for i, _ in secs}
-    data = parse_json(call_llm(build_prompt(brief, secs, batch)))
+    data = parse_json(call_llm(build_prompt(brief, secs, batch, pick_examples(batch, votes or []))))
     if not data or not isinstance(data.get("stories"), list):
         return [_single(it, None) for it in batch], []
 
@@ -264,17 +310,18 @@ def judge_stories(pool: list[dict]) -> tuple[list[dict], str]:
     secs = sections(brief)
     seq = order_by_similarity(pool)
     batches = [[pool[i] for i in seq[k:k + BATCH]] for k in range(0, len(seq), BATCH)]
-    log.info("julgando %d manchetes em %d lotes", len(pool), len(batches))
+    votes = load_votes()
+    log.info("julgando %d manchetes em %d lotes; %d votos como exemplos", len(pool), len(batches), len(votes))
 
     stories, strays = [], []
     with ThreadPoolExecutor(max_workers=4) as ex:
-        for st, sy in ex.map(lambda b: judge_batch(brief, secs, b), batches):
+        for st, sy in ex.map(lambda b: judge_batch(brief, secs, b, votes), batches):
             stories += st
             strays += sy
     if strays:  # uma segunda chance, num lote só deles
         log.info("%d extraviados, nova rodada", len(strays))
         for k in range(0, len(strays), BATCH):
-            st, sy = judge_batch(brief, secs, strays[k:k + BATCH])
+            st, sy = judge_batch(brief, secs, strays[k:k + BATCH], votes)
             stories += st + [_single(it, None) for it in sy]
 
     scored = sum(1 for s in stories if s["score"] is not None)

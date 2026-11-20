@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: "0 9 * * *"   # 09:00 UTC = 06:00 BRT (o GitHub pode atrasar alguns minutos)
   workflow_dispatch:
+    inputs:
+      so_remontar:
+        description: "Só remontar a página com o resultado já julgado hoje (não chama a LLM)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # grava o arquivo do dia em archive/
@@ -38,11 +43,17 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODELS: ${{ vars.LLM_MODELS }}
           JUDGE_THRESHOLD: ${{ vars.JUDGE_THRESHOLD || '70' }}
-        run: python build.py
+        run: |
+          if [ "${{ inputs.so_remontar }}" = "true" ]; then
+            python build.py --from "archive/$(TZ=America/Sao_Paulo date +%F).json"
+          else
+            python build.py
+          fi
 
       # Guarda o resultado do dia. Também mantém o repositório "ativo": o GitHub desliga
       # agendamentos de repositórios públicos sem nenhum commit em 60 dias.
       - name: Arquivar o dia
+        if: ${{ inputs.so_remontar != true }}
         run: |
           mkdir -p archive
           cp site/data.json "archive/$(TZ=America/Sao_Paulo date +%F).json"
@@ -50,6 +61,7 @@ jobs:
           git config user.email "portal-bot@users.noreply.github.com"
           git add archive
           git commit -m "arquivo $(TZ=America/Sao_Paulo date +%F)" || echo "nada novo"
+          git pull --rebase -q   # a página pode ter gravado votos enquanto isto rodava
           git push
 
       - uses: actions/configure-pages@v5
