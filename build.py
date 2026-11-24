@@ -240,8 +240,10 @@ article.no {{ opacity:.4; }}
           border-bottom:1px solid var(--line); }}
   nav {{ justify-content:flex-start; flex-wrap:nowrap; overflow-x:auto; font-size:12px; scrollbar-width:none; }}
 }}
-nav button {{ font:inherit; text-transform:inherit; letter-spacing:inherit; background:none; border:0; padding:0;
-               color:var(--link); cursor:pointer; white-space:nowrap; }}
+nav button {{ font:inherit; font-weight:600; text-transform:inherit; letter-spacing:inherit; background:var(--accent);
+               color:#fff; border:0; border-radius:999px; padding:3px 12px; margin:-3px 4px -3px 0; cursor:pointer;
+               white-space:nowrap; }}
+nav button:hover {{ filter:brightness(1.1); }}
 #linkpanel {{ border-bottom:1px solid var(--line); padding:14px 0; display:grid; gap:10px; font-size:14px; }}
 #linkpanel[hidden] {{ display:none; }}
 #linkform {{ display:grid; gap:8px; color:var(--muted); }}
@@ -287,7 +289,7 @@ footer button.save {{ text-decoration:none; color:#fff; background:var(--accent)
   <div class="dateline"><span>{longdate}</span><span>{s} histórias de {n} manchetes · edição das {time}</span></div>
   <div class="logo"><a href="#">O Portal</a></div>
 </header>
-<nav><button id="lnk" type="button">Ler link</button>{nav}</nav>
+<nav><button id="lnk" type="button">🔗 Ler um link</button>{nav}</nav>
 <div id="linkpanel" hidden>
   <form id="linkform"><label for="linkurl">Cole o endereço de uma matéria aberta. O GitHub busca o texto em cerca
   de 1 minuto e ele abre aqui, no leitor. Sites com paywall (Valor, Estadão, FT, WSJ…) abrem no site.</label>
