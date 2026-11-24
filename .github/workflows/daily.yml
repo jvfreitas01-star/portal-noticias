@@ -27,11 +27,11 @@ jobs:
     timeout-minutes: 20
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deploy1.outputs.page_url || steps.deploy2.outputs.page_url || steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -65,9 +65,23 @@ jobs:
           git pull --rebase -q   # a página pode ter gravado votos enquanto isto rodava
           git push
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
+      # A publicação às vezes falha do lado do GitHub ("Fetching artifact metadata failed", 21/11 e 24/11).
+      # Tenta até 3 vezes, esperando entre as tentativas; só falha o job se as 3 falharem.
+      - id: deploy1
+        uses: actions/deploy-pages@v5
+        continue-on-error: true
+      - if: steps.deploy1.outcome == 'failure'
+        run: sleep 90
+      - id: deploy2
+        if: steps.deploy1.outcome == 'failure'
+        uses: actions/deploy-pages@v5
+        continue-on-error: true
+      - if: steps.deploy2.outcome == 'failure'
+        run: sleep 180
       - id: deploy
-        uses: actions/deploy-pages@v4
+        if: steps.deploy2.outcome == 'failure'
+        uses: actions/deploy-pages@v5
