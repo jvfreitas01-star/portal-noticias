@@ -1,10 +1,10 @@
-# Roda todo dia às 6h (Brasília) nos servidores do GitHub e publica a página no GitHub Pages.
+# Roda todo dia às 6h, 12h e 18h (Brasília) nos servidores do GitHub e publica no GitHub Pages.
 # Também dá para rodar na mão: aba Actions > "Portal diário" > Run workflow.
 name: Portal diário
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # 09:00 UTC = 06:00 BRT (o GitHub pode atrasar alguns minutos)
+    - cron: "0 9,15,21 * * *"   # 09/15/21 UTC = 06h/12h/18h BRT (o GitHub costuma atrasar de 10 a 60 min)
   workflow_dispatch:
     inputs:
       so_remontar:

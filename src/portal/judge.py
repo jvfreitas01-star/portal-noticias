@@ -147,6 +147,9 @@ def call_llm(prompt: str) -> str | None:
             if r.status_code == 429:
                 _cooling[model] = time.time()
                 log.info("modelo %s em limite (429): fica de fora por %d s", model, COOLDOWN)
+            if r.status_code == 402:  # modelo pago sem saldo: não tenta mais nesta execução
+                _cooling[model] = float("inf")
+                log.warning("modelo %s sem saldo de crédito (402): fora nesta execução", model)
             if r.status_code in (401, 403):
                 _auth_failed = True
                 log.error("chave LLM_API_KEY recusada: confira o segredo no GitHub")
