@@ -3,3 +3,4 @@ feedparser>=6.0
 beautifulsoup4>=4.12
 requests>=2.31
 cryptography>=42
+curl_cffi>=0.17

@@ -23,11 +23,10 @@ from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import requests
 from bs4 import BeautifulSoup
 
-from .content import extract
-from .core import UA, clean
+from .content import amp_url, browser_get, extract
+from .core import clean
 from .vault import CHECK, ITERATIONS, LINKS_SALT, _b64, dec_with, enc_with, links_cipher
 
 log = logging.getLogger("portal.readlink")
@@ -68,23 +67,17 @@ def safe_get(url: str) -> tuple[str, bytes]:
             raise FetchError("endereço inválido")
         if not _host_is_public(p.hostname):
             raise FetchError("endereço não público")
-        r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/html,application/xhtml+xml",
-                                       "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
-                         timeout=20, allow_redirects=False, stream=True)
-        if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+        r = browser_get(url, allow_redirects=False, timeout=20)  # "cara" de Chrome, salto a salto
+        if r.status_code in (301, 302, 303, 307, 308):
             url = urljoin(url, r.headers.get("Location", ""))
-            r.close()
             continue
-        if not r.ok:
+        if not 200 <= r.status_code < 300:
             raise FetchError(f"o site respondeu HTTP {r.status_code}")
         if "html" not in r.headers.get("content-type", ""):
             raise FetchError("não é uma página HTML")
-        body = b""
-        for chunk in r.iter_content(65536):
-            body += chunk
-            if len(body) > MAX_BYTES:
-                raise FetchError("página grande demais")
-        return url, body
+        if len(r.content) > MAX_BYTES:
+            raise FetchError("página grande demais")
+        return url, r.content
     raise FetchError("redirecionamentos demais")
 
 
@@ -108,6 +101,14 @@ def read(url: str) -> dict:
     site = _meta(soup, "og:site_name") or host.removeprefix("www.")
     published = _meta(soup, "article:published_time", "og:published_time", "date")
     paras = extract(html, host)
+    if sum(map(len, paras)) < MIN_CHARS and (amp := amp_url(html, final)):
+        try:  # alguns sites entregam o texto inteiro só na versão AMP
+            _, amp_html = safe_get(amp)
+            alt = extract(amp_html, host)
+            if sum(map(len, alt)) > sum(map(len, paras)):
+                paras = alt
+        except FetchError:
+            pass
     if sum(map(len, paras)) < MIN_CHARS:
         raise FetchError("não achei o texto da matéria (pode ter paywall ou não ser uma notícia)")
     return {"t": title or final, "s": site, "p": published or None, "u": final, "x": paras}
