@@ -218,15 +218,19 @@ TAREFA:
 Agrupe as manchetes abaixo em histórias. Uma história = um acontecimento: manchetes em que ler uma
 torna as outras redundantes (mesma empresa e mesmo negócio, mesma decisão, mesmo dado divulgado).
 Tema parecido não basta. Na dúvida, separe. Manchetes em português e inglês sobre o mesmo fato vão juntas.
+Só junte manchetes que tenham o MESMO agente principal (empresa, pessoa, órgão) fazendo o MESMO ato, e todas
+precisam citar esse agente. Manchetes de resumo do dia ("Ibovespa hoje...", "...e mais destaques", "Markets
+Wrap", agendas, listas de vários assuntos) ficam SEMPRE sozinhas.
 Para cada história dê:
 - "items": índices das manchetes
 - "lead": índice da manchete mais informativa
 - "head": as 4 primeiras palavras da manchete lead, copiadas
+- "who": o agente principal, escrito como aparece nas manchetes (ex.: "Petrobras", "Fachin", "SEC")
 - "s": 0 a 100, a chance de eu querer ler isto
 - "sec": id da seção
 - "why": até 8 palavras, em português
 Toda manchete deve aparecer em exatamente uma história.
-Responda só com JSON: {{"stories": [{{"items": [int], "lead": int, "head": str, "s": int, "sec": str, "why": str}}]}}
+Responda só com JSON: {{"stories": [{{"items": [int], "lead": int, "head": str, "who": str, "s": int, "sec": str, "why": str}}]}}
 
 MANCHETES:
 {lines}"""
@@ -236,6 +240,31 @@ MANCHETES:
 
 def _title_words(it: dict) -> set[str]:
     return set(_words(it["title"]))
+
+
+# Manchetes de resumo do dia: falam de vários assuntos e por isso "ligam" fatos diferentes. Nunca entram em
+# grupo, e a nota fica limitada (raramente valem a leitura). Visto em 23/11: "Ibovespa hoje acompanha
+# ajuste fiscal, PMIs e plano da Petrobras" juntou o plano da Petrobras com a votação do ajuste fiscal.
+ROUNDUP = re.compile(
+    r"\b(ibovespa|bolsas?|mercados?|dolar|day trade)\s+hoje\b|\be mais destaques\b|\bdestaques do dia\b"
+    r"|\bo que (acompanhar|esperar|saber|move)\b|\bminuto a minuto\b|\bao vivo\b|\bresumo do dia\b"
+    r"|\bagenda do dia\b|\bsaiba quais\b.*\bpauta\b|\bmarkets wrap\b|^firstft\b|\bwhat to watch\b"
+    r"|\blive updates\b|\bmorning (briefing|bid)\b|\bevening briefing\b")
+ROUNDUP_MAX = 60
+STOP = {"de", "da", "do", "das", "dos", "the", "and", "for", "von"}
+
+
+def is_roundup(it: dict) -> bool:
+    return bool(ROUNDUP.search(fold(it["title"])))
+
+
+def _has_actor(it: dict, who: str) -> bool:
+    """A manchete cita o agente? Por palavra (3+ letras) ou radical de 5 letras ('Petrobras' ~ 'Petrobrás')."""
+    ww = [w for w in re.findall(r"[a-z0-9]{3,}", fold(who or "")) if w not in STOP and w not in GENERIC]
+    if not ww:
+        return False
+    tw = set(re.findall(r"[a-z0-9]{3,}", fold(it["title"])))
+    return any(w in tw or (len(w) >= 5 and any(t[:5] == w[:5] for t in tw if len(t) >= 5)) for w in ww)
 
 
 def _head_ok(head: str, lead_item: dict) -> bool:
@@ -281,19 +310,38 @@ def judge_batch(brief, secs, batch: list[dict], votes: list[dict] | None = None)
             strays += [batch[i] for i in idx]   # índices escorregaram
             used.update(idx)
             continue
-        good, bad = _connected(idx, lead, batch)
-        strays += [batch[i] for i in bad]
         used.update(idx)
         try:
             score = max(0, min(100, int(s.get("s", 0))))
         except (TypeError, ValueError):
             score = None
         sec = str(s.get("sec", "0"))
+        sec = sec if sec in valid_secs else "0"
+        why = str(s.get("why", ""))[:80]
+        # Resumos do dia saem do grupo e viram história própria, com nota limitada.
+        rounds = [i for i in idx if is_roundup(batch[i])]
+        for i in rounds:
+            stories.append({"items": [batch[i]], "score": None if score is None else min(score, ROUNDUP_MAX),
+                            "sec": sec, "why": "resumo do dia"})
+        idx = [i for i in idx if i not in rounds]
+        if not idx:
+            continue
+        if lead not in idx:
+            lead = idx[0]
+        good, bad = _connected(idx, lead, batch)
+        if len(good) > 1:  # mesmo agente: toda manchete do grupo precisa citá-lo
+            who = str(s.get("who", ""))
+            if not _has_actor(batch[lead], who):
+                bad, good = bad + [i for i in good if i != lead], [lead]
+            else:
+                bad += [i for i in good if not _has_actor(batch[i], who)]
+                good = [i for i in good if _has_actor(batch[i], who)]
+        strays += [batch[i] for i in bad]
         stories.append({
             "items": [batch[lead]] + [batch[i] for i in good if i != lead],
             "score": score,
-            "sec": sec if sec in valid_secs else "0",
-            "why": str(s.get("why", ""))[:80],
+            "sec": sec,
+            "why": why,
         })
     stories += [_single(batch[i], None) for i in range(len(batch)) if i not in used]
     return stories, strays
@@ -333,7 +381,7 @@ def _connected_group(idx: list[int], cands: list[dict]) -> list[int]:
 def merge_pass(stories: list[dict]) -> list[dict]:
     """Uma chamada com o lead de cada história forte: junta as que são o mesmo fato ('same') e
     aninha as de tema muito próximo sob a melhor ('related'). Se a LLM falhar, nada muda."""
-    cands = sorted((s for s in stories if (s["score"] or 0) >= MERGE_MIN),
+    cands = sorted((s for s in stories if (s["score"] or 0) >= MERGE_MIN and not is_roundup(s["items"][0])),
                    key=lambda s: -(s["score"] or 0))[:MERGE_MAX]
     if len(cands) < 2:
         return stories
@@ -349,8 +397,10 @@ Encontre:
   mesmo inquérito; o plano de investimento e o projeto de usinas da mesma companhia).
   NÃO são relacionadas: empresas diferentes no mesmo setor; o mesmo país em assuntos diferentes.
 Na dúvida, não agrupe: deixar separado é sempre aceitável, juntar errado esconde notícia.
+Todo grupo tem um agente comum ("who": a empresa, pessoa ou órgão, escrito como aparece nas linhas), e TODAS
+as linhas do grupo precisam citá-lo. Se não houver um agente citado em todas, não é grupo.
 Cada linha entra em no máximo um grupo. Grupos têm 2 ou mais linhas.
-Responda só com JSON: {{"same": [[int]], "related": [[int]]}}
+Responda só com JSON: {{"same": [{{"items": [int], "who": str}}], "related": [{{"items": [int], "who": str}}]}}
 
 HISTÓRIAS:
 {lines}"""
@@ -364,10 +414,15 @@ HISTÓRIAS:
     def groups(key: str) -> list[list[int]]:
         out = []
         for g in data.get(key) or []:
+            if not isinstance(g, dict) or not str(g.get("who", "")).strip():
+                continue  # sem agente comum declarado: não junta
+            who = str(g["who"])
             try:
-                idx = sorted({int(i) for i in g if 0 <= int(i) < len(cands)} - used)
+                idx = sorted({int(i) for i in g.get("items", []) if 0 <= int(i) < len(cands)} - used)
             except (TypeError, ValueError):
                 continue
+            # toda história do grupo precisa citar o agente no título principal
+            idx = [i for i in idx if _has_actor(cands[i]["items"][0], who)]
             idx = _connected_group(idx, cands)  # mesmo guarda dos lotes: precisa dividir palavras
             if key == "same" and len(idx) >= 2:
                 # "mesmo fato" exige mais: 2+ palavras distintivas em comum entre os TÍTULOS PRINCIPAIS e o da
@@ -378,7 +433,7 @@ HISTÓRIAS:
                 bw = stems(cands[best])
                 idx = [i for i in idx if i == best or len(stems(cands[i]) & bw) >= 2]
             if len(idx) >= 2:
-                log.info("junção %s: %s", key, " || ".join(cands[i]["items"][0]["title"][:50] for i in idx))
+                log.info("junção %s [%s]: %s", key, who, " || ".join(cands[i]["items"][0]["title"][:50] for i in idx))
                 used.update(idx)
                 out.append(idx)
         return out
