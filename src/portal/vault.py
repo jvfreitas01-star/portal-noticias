@@ -43,6 +43,26 @@ def seal(password: str, articles: dict[str, dict]) -> dict:
             "a": {aid: enc(a) for aid, a in articles.items()}}
 
 
+# "Ler link": a página cifra o endereço pedido (a fila fica num repositório público) e o GitHub devolve o
+# texto cifrado. Sal fixo e público, para a página conseguir cifrar antes de existir qualquer arquivo; o
+# segredo continua sendo só a senha.
+LINKS_SALT = b"portal-ler-link-v1"
+
+
+def links_cipher(password: str) -> AESGCM:
+    return AESGCM(PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=LINKS_SALT,
+                             iterations=ITERATIONS).derive(password.encode("utf-8")))
+
+
+def enc_with(aes: AESGCM, obj) -> dict:
+    nonce = os.urandom(12)
+    return {"n": _b64(nonce), "c": _b64(aes.encrypt(nonce, json.dumps(obj, ensure_ascii=False).encode("utf-8"), None))}
+
+
+def dec_with(aes: AESGCM, x: dict):
+    return json.loads(aes.decrypt(base64.b64decode(x["n"]), base64.b64decode(x["c"]), None))
+
+
 def open_sealed(password: str, sealed: dict) -> dict[str, dict]:
     """Inverso de seal (usado nos testes)."""
     key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=base64.b64decode(sealed["salt"]),

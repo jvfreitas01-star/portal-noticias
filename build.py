@@ -5,6 +5,7 @@ No GitHub Actions roda sozinho 1x por dia (ver .github/workflows/daily.yml).
 """
 from __future__ import annotations
 
+import base64
 import html
 import json
 import logging
@@ -19,7 +20,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from portal.content import fetch_for_stories  # noqa: E402
 from portal.core import collect  # noqa: E402
 from portal.judge import judge_stories, load_brief, sections  # noqa: E402
-from portal.vault import article_id, seal  # noqa: E402
+from portal.readlink import PAYWALL  # noqa: E402
+from portal.vault import ITERATIONS, LINKS_SALT, article_id, seal  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("portal.build")
@@ -140,12 +142,14 @@ def render(stories: list[dict], mode: str, n_items: int, texts: dict[str, str] |
 
     badge = ("" if mode == "ai" else
              '<p class="warn">A LLM não respondeu nesta execução: seleção feita só por palavras-chave.</p>')
-    data = json.dumps({"repo": REPO, "path": LABELS_PATH, "stories": rendered},
+    links = {"salt": base64.b64encode(LINKS_SALT).decode(), "iter": ITERATIONS, "queue": "reader/queue.jsonl",
+             "file": "reader/links.json", "paywall": list(PAYWALL)}
+    data = json.dumps({"repo": REPO, "path": LABELS_PATH, "stories": rendered, "links": links},
                       ensure_ascii=False).replace("</", "<\\/")
     longdate = f"{DIAS[now.weekday()].capitalize()}, {now.day} de {MESES[now.month - 1]} de {now.year}"
     return PAGE.format(date=now.strftime("%d/%m/%Y"), longdate=longdate, time=now.strftime("%H:%M"),
                        n=n_items, s=len(top), badge=badge, nav="".join(nav), body="".join(body)
-                       ).replace("__DATA__", data).replace("__VOTE_JS__", VOTE_JS).replace("__READER_JS__", READER_JS)
+                       ).replace("__DATA__", data).replace("__VOTE_JS__", VOTE_JS).replace("__READER_JS__", READER_JS).replace("__LINK_JS__", LINK_JS)
 
 
 PAGE = """<!doctype html>
@@ -234,8 +238,21 @@ article.no {{ opacity:.4; }}
   .grid {{ grid-template-columns:minmax(0,1fr); }}
   .big {{ grid-column:auto; grid-row:auto; padding-right:0; border-right:0; padding-bottom:16px;
           border-bottom:1px solid var(--line); }}
-  nav {{ justify-content:flex-start; flex-wrap:nowrap; overflow-x:auto; font-size:12px; }}
+  nav {{ justify-content:flex-start; flex-wrap:nowrap; overflow-x:auto; font-size:12px; scrollbar-width:none; }}
 }}
+nav button {{ font:inherit; text-transform:inherit; letter-spacing:inherit; background:none; border:0; padding:0;
+               color:var(--link); cursor:pointer; white-space:nowrap; }}
+#linkpanel {{ border-bottom:1px solid var(--line); padding:14px 0; display:grid; gap:10px; font-size:14px; }}
+#linkpanel[hidden] {{ display:none; }}
+#linkform {{ display:grid; gap:8px; color:var(--muted); }}
+#linkform .row {{ display:flex; gap:8px; }}
+#linkurl {{ flex:1; min-width:0; font:inherit; font-size:15px; padding:9px 12px; color:var(--fg); background:transparent;
+            border:1px solid var(--line); border-radius:8px; }}
+#linkform button {{ font:inherit; color:#fff; background:var(--accent); border:0; padding:9px 18px; border-radius:8px; cursor:pointer; }}
+#linkmsg:empty, #linkrecent:empty {{ display:none; }}
+#linkmsg a {{ color:var(--link); }}
+#linkrecent ul {{ margin:4px 0 0; padding-left:18px; }}
+#linkrecent button {{ font:inherit; color:var(--link); background:none; border:0; padding:0; cursor:pointer; text-align:left; }}
 #sync {{ position:sticky; bottom:0; background:var(--bg); border-top:1px solid var(--line);
          padding:8px 0; font-size:13px; color:var(--muted); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
 #sync:empty {{ display:none; }}
@@ -270,7 +287,15 @@ footer button.save {{ text-decoration:none; color:#fff; background:var(--accent)
   <div class="dateline"><span>{longdate}</span><span>{s} histórias de {n} manchetes · edição das {time}</span></div>
   <div class="logo"><a href="#">O Portal</a></div>
 </header>
-<nav>{nav}</nav>
+<nav><button id="lnk" type="button">Ler link</button>{nav}</nav>
+<div id="linkpanel" hidden>
+  <form id="linkform"><label for="linkurl">Cole o endereço de uma matéria aberta. O GitHub busca o texto em cerca
+  de 1 minuto e ele abre aqui, no leitor. Sites com paywall (Valor, Estadão, FT, WSJ…) abrem no site.</label>
+  <div class="row"><input id="linkurl" type="url" inputmode="url" autocomplete="off" placeholder="https://…">
+  <button type="submit">Ler</button></div></form>
+  <div id="linkmsg"></div>
+  <div id="linkrecent"></div>
+</div>
 {badge}
 {body}
 <div id="sync"></div>
@@ -288,6 +313,7 @@ footer button.save {{ text-decoration:none; color:#fff; background:var(--accent)
 <script id="portal-data" type="application/json">__DATA__</script>
 <script>__VOTE_JS__</script>
 <script>__READER_JS__</script>
+<script>__LINK_JS__</script>
 </body></html>
 """
 
@@ -336,6 +362,16 @@ function askPassword(aid, msg) {
   body.append(f); inp.focus();
 }
 
+function paint(a) {
+  orig.href = a.u;
+  const d = a.p ? new Date(a.p) : null;
+  const when = d && !isNaN(d) ? d.toLocaleString("pt-BR", {day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"}) : "";
+  body.replaceChildren(el("h1", a.t), el("div", [a.s, when].filter(Boolean).join(" · "), "meta"));
+  for (const p of a.x) body.append(el("p", p));
+  const end = el("p", "", "meta"), link = el("a", "Ler no site original ↗");
+  link.href = a.u; link.target = "_blank"; link.rel = "noopener"; end.append(link); body.append(end);
+}
+
 async function show(aid) {
   body.replaceChildren(el("p", "Abrindo…", "meta"));
   try {
@@ -345,13 +381,7 @@ async function show(aid) {
       if (!saved || !(await unlock(saved))) { store.set(""); return askPassword(aid); }
     }
     if (!v.a[aid]) throw new Error("texto não encontrado");
-    const a = await dec(key, v.a[aid]);
-    orig.href = a.u;
-    const when = a.p ? new Date(a.p).toLocaleString("pt-BR", {day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"}) : "";
-    body.replaceChildren(el("h1", a.t), el("div", [a.s, when].filter(Boolean).join(" · "), "meta"));
-    for (const p of a.x) body.append(el("p", p));
-    const end = el("p", "", "meta"), link = el("a", "Ler no site original ↗");
-    link.href = a.u; link.target = "_blank"; link.rel = "noopener"; end.append(link); body.append(end);
+    paint(await dec(key, v.a[aid]));
   } catch (e) {
     body.replaceChildren(el("p", "Não consegui abrir este texto (" + (e.message || "erro") + "). Use \"Abrir no site\".", "meta"));
   }
@@ -363,6 +393,13 @@ function open(aid, href) {
   show(aid);
 }
 function close() { box.hidden = true; document.body.style.overflow = ""; }
+// usado pelo "Ler link": abre um artigo já decifrado
+window.portalReader = {
+  openArticle(a) {
+    box.hidden = false; box.scrollTop = 0; document.body.style.overflow = "hidden";
+    history.pushState({reader: "link"}, "", "#ler"); paint(a);
+  },
+};
 
 document.addEventListener("click", e => {
   const a = e.target.closest("a[data-r]");
@@ -373,6 +410,139 @@ document.getElementById("rclose").addEventListener("click", () => history.state 
 addEventListener("popstate", () => { if (!box.hidden) close(); });
 addEventListener("keydown", e => { if (e.key === "Escape" && !box.hidden) history.back(); });
 if (location.hash === "#ler") history.replaceState(null, "", location.pathname);
+})();
+"""
+
+# Ler link: a página cifra o endereço com a senha do leitor e o acrescenta a reader/queue.jsonl (API do
+# GitHub, mesmo token dos votos); o workflow read-link.yml grava o texto cifrado em reader/links.json, que a
+# página acompanha. Ver src/portal/readlink.py. Todo texto entra na tela via textContent.
+LINK_JS = r"""
+(() => {
+const D = JSON.parse(document.getElementById("portal-data").textContent), L = D.links;
+const API = `https://api.github.com/repos/${D.repo}/contents/`;
+const panel = document.getElementById("linkpanel"), form = document.getElementById("linkform"),
+      input = document.getElementById("linkurl"), msg = document.getElementById("linkmsg"),
+      recent = document.getElementById("linkrecent");
+const bytes = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const b64 = u8 => { let r = ""; for (const x of u8) r += String.fromCharCode(x); return btoa(r); };
+const utf8b64 = s => b64(new TextEncoder().encode(s));
+const unb64 = s => new TextDecoder().decode(bytes(s.replace(/\n/g, "")));
+const ls = k => { try { return localStorage.getItem(k) || ""; } catch { return ""; } };
+const token = () => { try { return JSON.parse(ls("gh_token") || '""'); } catch { return ""; } };
+const H = () => ({Accept: "application/vnd.github+json", ...(token() ? {Authorization: `Bearer ${token()}`} : {})});
+let key = null, polling = null;
+
+function say(text, href) {
+  msg.replaceChildren(document.createTextNode(text));
+  if (href) { const a = document.createElement("a"); a.href = href; a.target = "_blank"; a.rel = "noopener";
+              a.textContent = " Abrir no site ↗"; msg.append(a); }
+}
+async function getKey() {
+  if (key) return key;
+  const pw = ls("reader_pw");
+  if (!pw) return null;
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+  key = await crypto.subtle.deriveKey({name: "PBKDF2", salt: bytes(L.salt), iterations: L.iter, hash: "SHA-256"},
+                                      base, {name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]);
+  return key;
+}
+async function enc(obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({name: "AES-GCM", iv}, await getKey(), new TextEncoder().encode(JSON.stringify(obj)));
+  return {n: b64(iv), c: b64(new Uint8Array(ct))};
+}
+async function dec(x) {
+  const pt = await crypto.subtle.decrypt({name: "AES-GCM", iv: bytes(x.n)}, await getKey(), bytes(x.c));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+async function sha1hex12(s) {
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-1", new TextEncoder().encode(s)));
+  return [...h].map(x => x.toString(16).padStart(2, "0")).join("").slice(0, 12);
+}
+async function loadLinks() {
+  const r = await fetch(API + L.file + "?t=" + Date.now(), {headers: H(), cache: "no-store"});
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error("GitHub " + r.status);
+  const j = await r.json();
+  return JSON.parse(unb64(j.content || ""));
+}
+async function appendQueue(line) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const g = await fetch(API + L.queue + "?t=" + Date.now(), {headers: H(), cache: "no-store"});
+    if (g.status === 401 || g.status === 403) throw new Error("token recusado");
+    let sha, old = "";
+    if (g.ok) { const j = await g.json(); sha = j.sha; old = unb64(j.content || ""); }
+    else if (g.status !== 404) throw new Error("GitHub " + g.status);
+    if (old && !old.endsWith("\n")) old += "\n";
+    const body = {message: "ler link", content: utf8b64(old + line + "\n")};
+    if (sha) body.sha = sha;
+    const p = await fetch(API + L.queue, {method: "PUT", headers: H(), body: JSON.stringify(body)});
+    if (p.ok) return;
+    if (p.status === 401 || p.status === 403) throw new Error("token recusado");
+    if (p.status !== 409 && p.status !== 422) throw new Error("GitHub " + p.status);
+  }
+  throw new Error("conflito, tente de novo");
+}
+async function openId(data, id) { window.portalReader.openArticle(await dec(data.a[id])); }
+
+async function showRecent(data) {
+  recent.replaceChildren();
+  if (!data || !Object.keys(data.a).length) return;
+  const items = Object.entries(data.a).sort((x, y) => (y[1].t || "").localeCompare(x[1].t || "")).slice(0, 10);
+  const ul = document.createElement("ul");
+  for (const [id, x] of items) {
+    let a; try { a = await dec(x); } catch { continue; }
+    const li = document.createElement("li"), b = document.createElement("button");
+    b.type = "button"; b.textContent = a.t; b.addEventListener("click", () => openId(data, id));
+    const src = document.createElement("span"); src.className = "src"; src.textContent = " " + a.s;
+    li.append(b, src); ul.append(li);
+  }
+  if (ul.children.length) { const h = document.createElement("div"); h.className = "label"; h.textContent = "Lidos nos últimos 7 dias"; recent.append(h, ul); }
+}
+
+async function check(id, url) {
+  const data = await loadLinks();
+  const st = data && data.st[id];
+  if (!st) return false;
+  clearInterval(polling); polling = null;
+  if (st.ok && data.a[id]) { say("Pronto."); await openId(data, id); showRecent(data); }
+  else say("Não deu para ler: " + (st.msg || "erro") + ".", url);
+  return true;
+}
+
+form.addEventListener("submit", async e => {
+  e.preventDefault();
+  const url = input.value.trim();
+  let u; try { u = new URL(url); } catch { return say("Cole um endereço completo, começando com https://"); }
+  if (!/^https?:$/.test(u.protocol)) return say("Cole um endereço completo, começando com https://");
+  const host = u.hostname.toLowerCase();
+  if (L.paywall.some(d => host === d || host.endsWith("." + d)))
+    return say("Esse site tem paywall: o texto não vem para o portal.", url);
+  if (!token()) return say("Configure antes o envio de votos (rodapé da página): o pedido usa o mesmo token.");
+  if (!ls("reader_pw")) return say("Abra antes uma matéria com 📖 e digite a senha do leitor: ela também cifra os pedidos.");
+  try {
+    const id = await sha1hex12(url);
+    if (await check(id, url)) return;
+    say("Enviando…");
+    await appendQueue(JSON.stringify({id, ts: new Date().toISOString(), u: await enc(url)}));
+    say("Pedido enviado. O GitHub leva cerca de 1 minuto; o texto abre sozinho aqui quando ficar pronto.");
+    input.value = "";
+    const t0 = Date.now(); clearInterval(polling);
+    polling = setInterval(async () => {
+      try {
+        if (await check(id, url)) return;
+        if (Date.now() - t0 > 5 * 60 * 1000) { clearInterval(polling); say("Demorou demais. Tente de novo em alguns minutos.", url); }
+      } catch {}
+    }, 8000);
+  } catch (err) { say("Erro: " + (err.message || "falha") + "."); }
+});
+
+document.getElementById("lnk").addEventListener("click", async () => {
+  panel.hidden = !panel.hidden;
+  if (panel.hidden) return;
+  input.focus();
+  try { if (await getKey()) showRecent(await loadLinks()); } catch {}
+});
 })();
 """
 
