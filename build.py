@@ -43,31 +43,42 @@ def hhmm(iso: str | None) -> str:
     return datetime.fromisoformat(iso).astimezone(BRT).strftime("%d/%m %H:%M")
 
 
-def story_html(s: dict, k: int, texts: dict[str, str]) -> str:
+DIAS = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
+MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro",
+         "novembro", "dezembro"]
+FRONT = 7  # abertura: 1 manchete principal, 2 embaixo dela e 4 na coluna ao lado
+
+
+def story_html(s: dict, k: int, texts: dict[str, str], kind: str = "card") -> str:
+    """kind: hero (manchete principal), side (coluna da abertura), big (abre a seção), card, mini (mostrar mais)."""
     lead, rest = s["items"][0], s["items"][1:]
     aid = next((texts[i["link"]] for i in s["items"] if i["link"] in texts), None)
     read = f' data-r="{aid}"' if aid else ""
-    badge = ' · <span class="rd">📖 texto completo</span>' if aid else ""
     votes = (f'<span class="vote" data-k="{k}"><button data-v="YES" title="Quero mais assim">👍</button>'
              f'<button data-v="NO" title="Não quero isto">👎</button></span>')
-    score = "" if s["score"] is None else f'<span class="score">{s["score"]}</span>'
-    why = f' · <span class="why">{esc(s["why"])}</span>' if s.get("why") else ""
+    kicker = f'<div class="kick">{esc(s["why"])}</div>' if s.get("why") and kind in ("hero", "big") else ""
+    meta = [f'<b>{esc(lead["source"])}</b>', hhmm(lead["published"])]
+    if s["score"] is not None:
+        meta.append(f'nota {s["score"]}')
+    if aid:
+        meta.append('<span class="rd">📖 texto completo</span>')
     more = ""
     if rest:
         rows = "".join(f'<li><a href="{esc(i["link"])}" target="_blank" rel="noopener">{esc(i["title"])}</a>'
-                       f' <span class="meta">{esc(i["source"])}</span></li>' for i in rest)
+                       f' <span class="src">{esc(i["source"])}</span></li>' for i in rest)
         more = f'<details class="also"><summary>+{len(rest)} fonte(s)</summary><ul>{rows}</ul></details>'
-    if s.get("related"):  # notícias diferentes do mesmo tema estreito, aninhadas pela passada de junção
+    if s.get("related"):  # notícias diferentes do mesmo caso, aninhadas pela passada de junção
         rows = "".join(f'<li><a href="{esc(r["items"][0]["link"])}" target="_blank" rel="noopener">'
-                       f'{esc(r["items"][0]["title"])}</a> <span class="meta">{esc(r["items"][0]["source"])}'
+                       f'{esc(r["items"][0]["title"])}</a> <span class="src">{esc(r["items"][0]["source"])}'
                        f'{" +" + str(len(r["items"]) - 1) if len(r["items"]) > 1 else ""}</span></li>'
                        for r in s["related"])
         more += (f'<details class="also"><summary>{len(s["related"])} relacionada(s)</summary>'
                  f'<ul>{rows}</ul></details>')
-    summary = f'<div class="sum">{esc(lead["summary"])}</div>' if lead["summary"] else ""
-    return (f'<article>{score}<a class="t" href="{esc(lead["link"])}" target="_blank" rel="noopener"{read}>'
-            f'{esc(lead["title"])}</a><div class="meta">{esc(lead["source"])} · {hhmm(lead["published"])}{why}{badge}</div>'
-            f'{summary}{more}{votes}</article>')
+    text = "" if lead["summary"].startswith("Matéria exclusiva para assinantes") else lead["summary"]
+    summary = f'<p class="sum">{esc(text)}</p>' if text and kind != "mini" else ""
+    return (f'<article class="{kind}">{kicker}<h3><a class="t" href="{esc(lead["link"])}" target="_blank" '
+            f'rel="noopener"{read}>{esc(lead["title"])}</a></h3>{summary}'
+            f'<div class="meta">{" · ".join(meta)}</div>{more}{votes}</article>')
 
 
 def top_stories(stories: list[dict], mode: str) -> list[dict]:
@@ -84,26 +95,46 @@ def render(stories: list[dict], mode: str, n_items: int, texts: dict[str, str] |
     secs = sections(load_brief()) + [("0", "Outros")]
     now = datetime.now(BRT)
     texts = texts or {}
-    keep = {id(s) for s in top_stories(stories, mode)}
-    body, shown, rendered = [], 0, []
+    top = top_stories(stories, mode)
+    keep = {id(s) for s in top}
+    rendered: list = []
 
-    def one(s: dict) -> str:
+    def one(s: dict, kind: str) -> str:
         rendered.append([{"link": i["link"], "title": i["title"], "source": i["source"],
                           "summary": i["summary"][:200]} for i in s["items"]])
-        return story_html(s, len(rendered) - 1, texts)
+        return story_html(s, len(rendered) - 1, texts, kind)
 
+    # Abertura: as FRONT maiores notas do dia, de qualquer seção.
+    front = sorted(top, key=lambda s: -(s["score"] or 0))[:FRONT]
+    in_front = {id(s) for s in front}
+    body = []
+    if front:
+        sub = "".join(one(s, "sub") for s in front[1:3])
+        body.append('<section id="destaques" class="front"><div class="hero-col">' + one(front[0], "hero")
+                    + (f'<div class="subs">{sub}</div>' if sub else "")
+                    + '</div><div class="side-col"><div class="label">Também em destaque</div>'
+                    + "".join(one(s, "side") for s in front[3:]) + "</div></section>")
+
+    nav = ['<a href="#destaques">Destaques</a>'] if front else []
     for sid, name in secs:
         mine = [s for s in stories if s["sec"] == sid]
-        top = [s for s in mine if id(s) in keep]
-        shown += len(top)
-        rest = [s for s in mine if s not in top][:MAX_MORE]
-        if not top and not rest:
+        sel = [s for s in mine if id(s) in keep and id(s) not in in_front]
+        rest = [s for s in mine if id(s) not in keep][:MAX_MORE]
+        if not sel and not rest:
             continue
-        part = [f'<section><h2>{esc(name)} <span class="n">{len(top)}</span></h2>']
-        part += [one(s) for s in top] or ([] if sid == "0" else ['<p class="empty">Nada acima do corte hoje.</p>'])
+        n_sec = sum(1 for s in mine if id(s) in keep)
+        if sid != "0":
+            nav.append(f'<a href="#sec-{sid}">{esc(name)}<span>{n_sec}</span></a>')
+        part = [f'<section id="sec-{sid}" class="sec"><h2>{esc(name)}</h2>']
+        if sel:
+            part.append('<div class="grid">' + one(sel[0], "big") + "".join(one(s, "card") for s in sel[1:])
+                        + "</div>")
+        elif sid != "0":
+            part.append('<p class="empty">Nada além da abertura acima do corte hoje.</p>' if n_sec else
+                        '<p class="empty">Nada acima do corte hoje.</p>')
         if rest:
-            part.append(f'<details class="more"><summary>Mostrar mais ({len(rest)})</summary>'
-                        + "".join(one(s) for s in rest) + "</details>")
+            part.append(f'<details class="more"><summary>Mostrar mais ({len(rest)})</summary><div class="minis">'
+                        + "".join(one(s, "mini") for s in rest) + "</div></details>")
         part.append("</section>")
         body.append("".join(part))
 
@@ -111,8 +142,9 @@ def render(stories: list[dict], mode: str, n_items: int, texts: dict[str, str] |
              '<p class="warn">A LLM não respondeu nesta execução: seleção feita só por palavras-chave.</p>')
     data = json.dumps({"repo": REPO, "path": LABELS_PATH, "stories": rendered},
                       ensure_ascii=False).replace("</", "<\\/")
-    return PAGE.format(date=now.strftime("%d/%m/%Y"), time=now.strftime("%H:%M"),
-                       n=n_items, s=shown, badge=badge, body="".join(body)
+    longdate = f"{DIAS[now.weekday()].capitalize()}, {now.day} de {MESES[now.month - 1]} de {now.year}"
+    return PAGE.format(date=now.strftime("%d/%m/%Y"), longdate=longdate, time=now.strftime("%H:%M"),
+                       n=n_items, s=len(top), badge=badge, nav="".join(nav), body="".join(body)
                        ).replace("__DATA__", data).replace("__VOTE_JS__", VOTE_JS).replace("__READER_JS__", READER_JS)
 
 
@@ -120,48 +152,96 @@ PAGE = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Portal · {date}</title>
+<title>O Portal · {date}</title>
 <style>
-:root {{ --bg:#fafaf8; --fg:#1d1d1b; --muted:#6b6b66; --line:#e4e3de; --accent:#0b5cad; --chip:#efeee9; --warn:#8a5a00; }}
+:root {{ --bg:#f8f6f1; --paper:#fffdf8; --fg:#191817; --muted:#66645e; --line:#dcd8cf; --rule:#191817;
+        --accent:#8c1c13; --link:#0b4f8a; --chip:#efebe2; --warn:#8a5a00;
+        --serif:Georgia,"Times New Roman",Times,serif; --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }}
 @media (prefers-color-scheme: dark) {{
-  :root {{ --bg:#161615; --fg:#ecebe6; --muted:#9a9993; --line:#2c2c2a; --accent:#6aa9ec; --chip:#242422; --warn:#e0b25a; }} }}
+  :root {{ --bg:#141413; --paper:#1b1a19; --fg:#ece9e2; --muted:#a19e96; --line:#34322f; --rule:#ece9e2;
+          --accent:#e0766b; --link:#7fb0e6; --chip:#262523; --warn:#e0b25a; }} }}
 * {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; }}
-main {{ max-width:780px; margin:0 auto; padding:20px 16px 60px; }}
-header {{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
-h1 {{ font-size:22px; margin:0; }}
-.st {{ color:var(--muted); font-size:13px; }}
-h2 {{ font-size:15px; text-transform:uppercase; letter-spacing:.04em; margin:28px 0 4px;
-      padding-bottom:6px; border-bottom:2px solid var(--fg); }}
-h2 .n {{ color:var(--muted); font-weight:400; }}
-article {{ padding:12px 0; border-bottom:1px solid var(--line); }}
-a.t {{ color:inherit; text-decoration:none; font-weight:600; }}
-a.t:hover, .also a:hover {{ color:var(--accent); }}
-.score {{ float:right; margin-left:10px; font-size:12px; color:var(--muted); background:var(--chip);
-          padding:1px 7px; border-radius:999px; }}
-.meta {{ color:var(--muted); font-size:13px; margin-top:2px; }}
-.why {{ font-style:italic; }}
-.sum {{ color:var(--muted); font-size:14px; margin-top:4px; display:-webkit-box; -webkit-line-clamp:2;
-        -webkit-box-orient:vertical; overflow:hidden; }}
-details summary {{ cursor:pointer; color:var(--accent); font-size:13px; margin-top:6px; }}
+body {{ margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 var(--sans); }}
+main {{ max-width:1120px; margin:0 auto; padding:0 16px 60px; background:var(--paper); min-height:100vh; }}
+.mast {{ text-align:center; padding:14px 0 0; }}
+.dateline {{ display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; font-size:12px; color:var(--muted);
+             border-bottom:1px solid var(--line); padding-bottom:8px; }}
+.logo {{ font:400 clamp(40px,8vw,72px)/1 var(--serif); letter-spacing:-.01em; margin:14px 0 10px; }}
+.logo a {{ color:inherit; text-decoration:none; }}
+nav {{ position:sticky; top:0; z-index:5; background:var(--paper); display:flex; gap:4px 20px; justify-content:center;
+       flex-wrap:wrap; padding:8px 0; border-top:3px double var(--rule); border-bottom:1px solid var(--rule);
+       font-size:13px; text-transform:uppercase; letter-spacing:.06em; }}
+nav a {{ color:inherit; text-decoration:none; white-space:nowrap; }}
+nav a:hover {{ color:var(--accent); }}
+nav span {{ color:var(--muted); margin-left:5px; font-size:11px; }}
+.warn {{ color:var(--warn); font-size:14px; text-align:center; }}
+h2 {{ font:700 13px/1 var(--sans); text-transform:uppercase; letter-spacing:.08em; color:var(--accent);
+      margin:34px 0 14px; padding-top:10px; border-top:2px solid var(--rule); }}
+h3 {{ margin:0; font-family:var(--serif); font-weight:700; }}
+a.t {{ color:inherit; text-decoration:none; }}
+a.t:hover {{ text-decoration:underline; text-decoration-thickness:1px; text-underline-offset:3px; }}
+article {{ min-width:0; }}
+.kick {{ font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--accent); margin-bottom:6px; }}
+.sum {{ font-family:var(--serif); color:var(--muted); margin:6px 0 0; display:-webkit-box; -webkit-box-orient:vertical;
+        overflow:hidden; -webkit-line-clamp:3; }}
+.meta {{ font-size:12px; color:var(--muted); margin-top:6px; }}
+.meta b {{ color:var(--fg); font-weight:600; }}
+.rd {{ color:var(--link); }}
+.front {{ display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:28px; padding:22px 0 6px; }}
+.hero h3 {{ font-size:clamp(28px,3.6vw,42px); line-height:1.12; letter-spacing:-.01em; }}
+.hero .sum {{ font-size:19px; line-height:1.5; -webkit-line-clamp:5; margin-top:12px; }}
+.side-col {{ border-left:1px solid var(--line); padding-left:24px; }}
+.subs {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:24px; margin-top:20px; padding-top:16px;
+         border-top:1px solid var(--line); }}
+.sub + .sub {{ border-left:1px solid var(--line); padding-left:24px; }}
+.sub h3 {{ font-size:21px; line-height:1.2; }}
+.sub .sum {{ font-size:15px; -webkit-line-clamp:4; }}
+.label {{ font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin-bottom:6px; }}
+.side {{ padding:12px 0; border-bottom:1px solid var(--line); }}
+.side:last-child {{ border-bottom:0; }}
+.side h3 {{ font-size:19px; line-height:1.25; }}
+.side .sum {{ font-size:14px; -webkit-line-clamp:2; }}
+.grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:22px 28px; }}
+.grid > article + article {{ }}
+.big {{ grid-column:span 2; grid-row:span 2; padding-right:28px; border-right:1px solid var(--line); }}
+.big h3 {{ font-size:clamp(24px,2.6vw,30px); line-height:1.15; }}
+.big .sum {{ font-size:17px; -webkit-line-clamp:6; margin-top:10px; }}
+.card {{ padding-bottom:16px; border-bottom:1px solid var(--line); }}
+.card h3 {{ font-size:18px; line-height:1.25; }}
+.card .sum {{ font-size:14px; }}
+.more > summary {{ margin:16px 0 6px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; }}
+.minis {{ columns:2 320px; column-gap:28px; }}
+.mini {{ break-inside:avoid; padding:8px 0; border-bottom:1px solid var(--line); }}
+.mini h3 {{ font-size:15px; line-height:1.3; font-weight:400; }}
+.empty {{ color:var(--muted); font-size:14px; font-style:italic; }}
+details summary {{ cursor:pointer; color:var(--link); font-size:12px; margin-top:6px; }}
 .also ul {{ margin:6px 0 0; padding-left:18px; font-size:14px; }}
 .also a {{ color:inherit; }}
-.more > summary {{ margin:12px 0; font-size:14px; }}
-.more article {{ opacity:.85; }}
-.empty {{ color:var(--muted); font-size:14px; }}
-.warn {{ color:var(--warn); font-size:14px; }}
-.vote {{ display:flex; gap:6px; margin-top:8px; }}
-.vote button {{ font-size:14px; line-height:1; padding:5px 10px; border-radius:999px; cursor:pointer;
-               background:transparent; border:1px solid var(--line); color:inherit; filter:grayscale(1); opacity:.6; }}
+.also a:hover {{ color:var(--link); }}
+.src {{ color:var(--muted); font-size:12px; }}
+.vote {{ display:inline-flex; gap:6px; margin-top:8px; }}
+.vote button {{ font-size:13px; line-height:1; padding:4px 9px; border-radius:999px; cursor:pointer;
+               background:transparent; border:1px solid var(--line); color:inherit; filter:grayscale(1); opacity:.55; }}
+.vote button:hover {{ opacity:.9; }}
 .vote button.on {{ filter:none; opacity:1; border-color:var(--accent); background:var(--chip); }}
-article.no {{ opacity:.45; }}
+article.no {{ opacity:.4; }}
+@media (max-width: 760px) {{
+  .front {{ grid-template-columns:minmax(0,1fr); gap:8px; }}
+  .side-col {{ border-left:0; padding-left:0; border-top:1px solid var(--line); padding-top:6px; }}
+  .subs {{ grid-template-columns:minmax(0,1fr); }}
+  .hero .sum {{ font-size:17px; -webkit-line-clamp:4; }}
+  .sub + .sub {{ border-left:0; padding-left:0; border-top:1px solid var(--line); padding-top:14px; }}
+  .grid {{ grid-template-columns:minmax(0,1fr); }}
+  .big {{ grid-column:auto; grid-row:auto; padding-right:0; border-right:0; padding-bottom:16px;
+          border-bottom:1px solid var(--line); }}
+  nav {{ justify-content:flex-start; flex-wrap:nowrap; overflow-x:auto; font-size:12px; }}
+}}
 #sync {{ position:sticky; bottom:0; background:var(--bg); border-top:1px solid var(--line);
          padding:8px 0; font-size:13px; color:var(--muted); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
 #sync:empty {{ display:none; }}
 #sync button, footer button {{ font:inherit; font-size:13px; color:var(--accent); background:none; border:0;
                                padding:0; cursor:pointer; text-decoration:underline; }}
 footer {{ margin-top:40px; font-size:13px; color:var(--muted); }}
-.rd {{ color:var(--accent); }}
 #reader {{ position:fixed; inset:0; z-index:10; overflow-y:auto; background:var(--bg); }}
 #reader[hidden] {{ display:none; }}
 .rbar {{ position:sticky; top:0; display:flex; justify-content:space-between; align-items:center; gap:12px;
@@ -186,7 +266,11 @@ footer {{ margin-top:40px; font-size:13px; color:var(--muted); }}
 footer button.save {{ text-decoration:none; color:#fff; background:var(--accent); padding:8px 14px; border-radius:8px; }}
 </style></head>
 <body><main>
-<header><h1>Portal · {date}</h1><span class="st">{s} histórias de {n} manchetes · gerado às {time}</span></header>
+<header class="mast">
+  <div class="dateline"><span>{longdate}</span><span>{s} histórias de {n} manchetes · edição das {time}</span></div>
+  <div class="logo"><a href="#">O Portal</a></div>
+</header>
+<nav>{nav}</nav>
 {badge}
 {body}
 <div id="sync"></div>

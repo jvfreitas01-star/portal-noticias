@@ -12,6 +12,7 @@ import math
 import os
 import re
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -84,11 +85,15 @@ def order_by_similarity(items: list[dict]) -> list[int]:
 
 # Preferidos quando LLM_MODELS está vazio (grátis e com JSON em 2026-11-20). Os que sumirem do
 # catálogo são pulados; se nenhum sobrar, usa os :free maiores que o catálogo oferecer.
-PREFERRED = ["google/gemma-4-31b-it:free", "nvidia/nemotron-3.5-super-vl:free", "google/gemma-4-26b-a4b-it:free"]
+# Nemotron primeiro: de 20 a 23/11 respondeu todos os lotes, enquanto o Gemma 31B devolveu 429 em quase toda
+# chamada (e no plano grátis cada 429 também gasta a cota diária).
+PREFERRED = ["nvidia/nemotron-3.5-super-vl:free", "google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free"]
 
 _free_cache: list[str] | None = None
 _lock = threading.Lock()
 _auth_failed = False  # chave recusada: não adianta tentar outros modelos (e cada tentativa gasta cota)
+_cooling: dict[str, float] = {}  # modelo -> hora do último 429: fica de fora por COOLDOWN segundos
+COOLDOWN = 90
 
 
 def _models() -> list[str]:
@@ -120,7 +125,8 @@ def call_llm(prompt: str) -> str | None:
     global _auth_failed
     if not LLM_API_KEY or _auth_failed:
         return None
-    for model in _models()[:MAX_TRIES_PER_BATCH]:
+    now = time.time()
+    for model in [m for m in _models() if now - _cooling.get(m, 0) > COOLDOWN][:MAX_TRIES_PER_BATCH]:
         if _auth_failed:
             return None
         try:
@@ -138,6 +144,9 @@ def call_llm(prompt: str) -> str | None:
                     log.info("lote respondido por %s", model)
                     return text
             log.warning("modelo %s: HTTP %s %s", model, r.status_code, r.text[:200])
+            if r.status_code == 429:
+                _cooling[model] = time.time()
+                log.info("modelo %s em limite (429): fica de fora por %d s", model, COOLDOWN)
             if r.status_code in (401, 403):
                 _auth_failed = True
                 log.error("chave LLM_API_KEY recusada: confira o segredo no GitHub")
