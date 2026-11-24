@@ -257,7 +257,7 @@ def _title_words(it: dict) -> set[str]:
 ROUNDUP = re.compile(
     r"\b(ibovespa|bolsas?|mercados?|dolar|day trade)\s+hoje\b|\be mais destaques\b|\bdestaques do dia\b"
     r"|\bo que (acompanhar|esperar|saber|move)\b|\bminuto a minuto\b|\bao vivo\b|\bresumo do dia\b"
-    r"|\bagenda do dia\b|\bsaiba quais\b.*\bpauta\b|\bmarkets wrap\b|^firstft\b|\bwhat to watch\b"
+    r"|^agenda\b|\bagenda do dia\b|\bsaiba quais\b.*\bpauta\b|\bmarkets wrap\b|^firstft\b|\bwhat to watch\b"
     r"|\blive updates\b|\bmorning (briefing|bid)\b|\bevening briefing\b")
 ROUNDUP_MAX = 60
 STOP = {"de", "da", "do", "das", "dos", "the", "and", "for", "von"}
