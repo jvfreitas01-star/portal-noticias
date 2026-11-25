@@ -1,5 +1,9 @@
 # Roda todo dia às 6h, 12h e 18h (Brasília) nos servidores do GitHub e publica no GitHub Pages.
 # Também dá para rodar na mão: aba Actions > "Portal diário" > Run workflow.
+#
+# Dois jobs, como no modelo oficial do GitHub Pages: "gerar" (coleta, LLM, arquivo do dia, envio do site)
+# e "publicar". Se só a publicação falhar, use "Re-run failed jobs": repete só o "publicar", com o site
+# já gerado, sem chamar a LLM de novo nem mexer no arquivo do dia.
 name: Portal diário
 
 on:
@@ -22,12 +26,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  gerar:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy1.outputs.page_url || steps.deploy2.outputs.page_url || steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
 
@@ -53,24 +54,44 @@ jobs:
 
       # Guarda o resultado do dia. Também mantém o repositório "ativo": o GitHub desliga
       # agendamentos de repositórios públicos sem nenhum commit em 60 dias.
+      # Grava sempre por cima da versão MAIS NOVA do repositório: um agendamento atrasado ou um re-run
+      # começa de um commit antigo, e em 25/11 isso deu conflito no arquivo do dia e impediu a publicação.
+      # Por isso também não bloqueia a publicação se falhar (continue-on-error).
       - name: Arquivar o dia
         if: ${{ inputs.so_remontar != true }}
+        continue-on-error: true
         run: |
-          mkdir -p archive
-          cp site/data.json "archive/$(TZ=America/Sao_Paulo date +%F).json"
+          DAY="$(TZ=America/Sao_Paulo date +%F)"
+          cp site/data.json "$RUNNER_TEMP/dia.json"
           git config user.name "portal-bot"
           git config user.email "portal-bot@users.noreply.github.com"
-          git add archive
-          git commit -m "arquivo $(TZ=America/Sao_Paulo date +%F)" || echo "nada novo"
-          git pull --rebase -q   # a página pode ter gravado votos enquanto isto rodava
-          git push
+          for i in 1 2 3; do
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            mkdir -p archive
+            cp "$RUNNER_TEMP/dia.json" "archive/$DAY.json"
+            git add archive
+            git commit -q -m "arquivo $DAY" || { echo "nada novo"; exit 0; }
+            git push -q origin HEAD:main && exit 0
+            sleep 5   # alguém gravou (votos, Ler link) entre o fetch e o push: tenta de novo
+          done
+          exit 1
 
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site
-      # A publicação às vezes falha do lado do GitHub ("Fetching artifact metadata failed", 21/11 e 24/11).
-      # Tenta até 3 vezes, esperando entre as tentativas; só falha o job se as 3 falharem.
+
+  publicar:
+    needs: gerar
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy1.outputs.page_url || steps.deploy2.outputs.page_url || steps.deploy.outputs.page_url }}
+    steps:
+      # A publicação às vezes falha do lado do GitHub ("Fetching artifact metadata failed": 20, 21, 24 e
+      # 25/11). Tenta até 3 vezes, esperando entre as tentativas; só falha se as 3 falharem.
       - id: deploy1
         uses: actions/deploy-pages@v5
         continue-on-error: true
